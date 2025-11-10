@@ -1,0 +1,4 @@
+# ninja log v6
+26	11486	7803108001716787	C:/Users/brack/Projects/gaussian-splatting/submodules/simple-knn/build/temp.win-amd64-cpython-310/Release/simple_knn.obj	187fe66713464d28
+22	18167	7803108001676673	C:/Users/brack/Projects/gaussian-splatting/submodules/simple-knn/build/temp.win-amd64-cpython-310/Release/ext.obj	cccd740bb6e178d8
+32	64572	7803108001772886	C:/Users/brack/Projects/gaussian-splatting/submodules/simple-knn/build/temp.win-amd64-cpython-310/Release/spatial.obj	5d411b929ba5f1cf

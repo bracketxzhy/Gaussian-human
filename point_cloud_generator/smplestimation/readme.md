@@ -4,14 +4,14 @@ This module is build based on [ICON](https://github.com/YuliangXiu/ICON). Please
 
 `git clone https://github.com/YuliangXiu/ICON`
 
-And then follow the instructions of ICON to prepare the environment and the necessary data. 
+And then follow the instructions of ICON to prepare the environment and the necessary data.
 Then run:
 
-`mv refinesmplhap.py ICON/apps` 
+`mv refinesmplhap.py ICON/apps`
 
-`mv newp2f.py ICON/apps` 
+`mv newp2f.py ICON/apps`
 
-`mv RefineSMPLDataset.py ICON/lib/dataset` 
+`mv RefineSMPLDataset.py ICON/lib/dataset`
 
 We provide an example folder which contains an image and a partial point cloud, you can run:
 

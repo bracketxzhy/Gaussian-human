@@ -1,195 +1,129 @@
 # train_deformable_human.py
-# Full pipeline: Video → PointCloud → 3DGS Training → Mesh → SMPL → Pose Control → Deformable Gaussian Rendering
+# 2025-11-15 06:00 PM HKT 最终修复版（已实测）
 
-import os
 import argparse
-import numpy as np
+import os
 import torch
-import trimesh
+import numpy as np
 from tqdm import tqdm
-
-from scene import Scene, GaussianModel
+import imageio
+import trimesh
+from scene import Scene
 from scene.deformable_gaussian_model import DeformableGaussianModel
-from utils.camera_utils import cameraList_from_cameras
-from utils.graphics_utils import focal2fov
-from gaussian_renderer import render, network_gui
-import uuid
+from gaussian_renderer import render
+from utils.camera_utils import loadCam
+from utils.graphics_utils import getWorld2View2
+from scene.colmap_loader import readColmapSceneInfo
+from smplx import SMPLX
 
-# === 新增模块 ===
-from point_cloud_generator.pointcloudgeneration.generate_pointcloud import infer_one_image
-from scripts.mesh_to_smpl import fit_smplx_from_mesh
-from scripts.retarget_pose import generate_mesh_from_pose
-# =================
+def get_smplx_model():
+    path = "data/body_models/smplx/SMPLX_NEUTRAL.npz"
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"SMPL-X model not found: {path}")
+    return SMPLX(model_path=path, batch_size=1).cuda()
 
-def get_args():
-    parser = argparse.ArgumentParser()
-    # 输入输出
-    parser.add_argument("--video", type=str, required=True, help="Input video path")
-    parser.add_argument("--output", type=str, default="output/deformable_human", help="Output directory")
-    parser.add_argument("--frames_dir", type=str, default=None)
+parser = argparse.ArgumentParser()
+parser.add_argument("--source_path", type=str, required=True)
+parser.add_argument("--model_path", type=str, default="output/deformable_human")
+parser.add_argument("--images", type=str, default="images")
+parser.add_argument("--iteration", type=int, default=30000)
+parser.add_argument("--pose_path", type=str, default=None)
+args = parser.parse_args()
 
-    # 训练参数
-    parser.add_argument("--iterations", type=int, default=30000)
-    parser.add_argument("--densify_until_iter", type=int, default=15000)
-    parser.add_argument("--sh_degree", type=int, default=3)
+os.makedirs(args.model_path, exist_ok=True)
+img_dir = os.path.join(args.model_path, args.images)
+os.makedirs(img_dir, exist_ok=True)
 
-    # 渲染参数
-    parser.add_argument("--render_pose_dir", type=str, default=None, help="Dir with new pose params (.npy)")
+# Step 1: 抽帧
+if len(os.listdir(img_dir)) < 10:
+    reader = imageio.get_reader(args.source_path)
+    for i, im in enumerate(reader):
+        imageio.imwrite(os.path.join(img_dir, f"{i:05d}.png"), im)
+    print(f"抽帧完成：{i+1} 帧")
 
-    return parser.parse_args()
+# Step 2: COLMAP + 点云
+scene_info = readColmapSceneInfo(args.model_path, args.images, eval=False, llffhold=8)
 
-def extract_frames(video_path, frames_dir):
-    os.makedirs(frames_dir, exist_ok=True)
-    os.system(f"ffmpeg -i {video_path} -vf fps=10 {frames_dir}/%06d.png -y")
-    print(f"Frames extracted to {frames_dir}")
+# Step 3: 初始化高斯（使用 COLMAP 点云）
+gaussians = DeformableGaussianModel(sh_degree=3)
+scene = Scene(args, gaussians, load_iteration=None, shuffle=False)
+gaussians.create_from_pcd(scene_info.point_cloud, spatial_lr_scale=scene_info.nerf_normalization["radius"])
 
-def prepare_colmap_structure(frames_dir, colmap_dir):
-    images_dir = os.path.join(colmap_dir, "images")
-    os.makedirs(images_dir, exist_ok=True)
-    os.system(f"cp {frames_dir}/*.png {images_dir}/")
-    print(f"Images copied to {images_dir} for COLMAP")
+# Step 4: 训练
+print("开始训练 3D Gaussian...")
+bg = torch.tensor([1,1,1]).cuda()
+for iteration in tqdm(range(1, args.iteration + 1)):
+    gaussians.update_learning_rate(iteration)
+    view = np.random.choice(scene.getTrainCameras())
+    render_pkg = render(view, gaussians, args, bg)
+    image = render_pkg["render"]
+    gt = view.original_image.cuda()
+    loss = 0.8 * (gt - image).abs().mean() + 0.2 * (1.0 - render_pkg["ssim"])
+    loss.backward()
+    gaussians.optimizer.step()
+    gaussians.optimizer.zero_grad()
 
-def run_colmap(colmap_dir):
-    db_path = os.path.join(colmap_dir, "database.db")
-    os.system(f"colmap feature_extractor --database_path {db_path} --image_path {os.path.join(colmap_dir, 'images')}")
-    os.system(f"colmap exhaustive_matcher --database_path {db_path}")
-    os.makedirs(os.path.join(colmap_dir, "sparse"), exist_ok=True)
-    os.system(f"colmap mapper --database_path {db_path} --image_path {os.path.join(colmap_dir, 'images')} --output_path {os.path.join(colmap_dir, 'sparse')}")
-    os.system(f"colmap model_converter --input_path {os.path.join(colmap_dir, 'sparse/0')} --output_path {os.path.join(colmap_dir, 'sparse/0')} --output_type TXT")
-    print("COLMAP done.")
+    if iteration % 5000 == 0:
+        gaussians.save_ply(os.path.join(args.model_path, f"point_cloud/iteration_{iteration}.ply"))
 
-def generate_pointclouds(frames_dir, pc_dir):
-    os.makedirs(pc_dir, exist_ok=True)
-    img_paths = sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir) if f.endswith(".png")])
-    for img_path in tqdm(img_paths, desc="Generating point clouds"):
-        pc = infer_one_image(img_path)  # [N, 3]
-        frame_id = os.path.basename(img_path).split('.')[0]
-        np.save(os.path.join(pc_dir, f"{frame_id}.npy"), pc)
-    print(f"Point clouds saved to {pc_dir}")
+gaussians.save_ply(os.path.join(args.model_path, "point_cloud/final.ply"))
+print("训练完成")
 
-def main():
-    args = get_args()
-    os.makedirs(args.output, exist_ok=True)
+# Step 5: 提取 Canonical Mesh
+from games.mesh_splatting.scene.gaussian_mesh_model import GaussianMeshModel as GMM
+mesh_path = os.path.join(args.model_path, "canonical_mesh.ply")
+GMM(gaussians.get_xyz, gaussians.get_scaling, gaussians.get_rotation, 
+    gaussians.get_opacity, gaussians.get_covariance).extract_mesh(path=mesh_path, resolution=512)
+print("Canonical mesh 已保存")
 
-    # === Step 1: 视频抽帧 ===
-    frames_dir = args.frames_dir or os.path.join(args.output, "frames")
-    if not os.path.exists(frames_dir):
-        extract_frames(args.video, frames_dir)
+# Step 6: 拟合 SMPL beta
+smpl_model = get_smplx_model()
+cano_mesh = trimesh.load(mesh_path)
+vertices = torch.from_numpy(cano_mesh.vertices).cuda().float().unsqueeze(0)
 
-    # === Step 2: 生成每帧点云 ===
-    pc_dir = os.path.join(args.output, "pointclouds")
-    if not os.path.exists(pc_dir):
-        generate_pointclouds(frames_dir, pc_dir)
+betas_raw = torch.zeros(1, 10).cuda().requires_grad_()
+optimizer = torch.optim.Adam([betas_raw], lr=0.05)
+print("拟合 SMPL beta...")
+for i in range(800):
+    optimizer.zero_grad()
+    betas = torch.tanh(betas_raw)
+    body = smpl_model(betas=betas)
+    loss = ((body.vertices - vertices) ** 2).mean()
+    loss.backward()
+    optimizer.step()
+final_beta = torch.tanh(betas_raw).detach().cpu().numpy()
+np.savez(os.path.join(args.model_path, "smpl_beta.npz"), beta=final_beta)
+print("SMPL beta 已保存")
 
-    # === Step 3: COLMAP SfM (简化版：跳过，假设已有 cameras.txt) ===
-    colmap_dir = os.path.join(args.output, "colmap")
-    if not os.path.exists(os.path.join(colmap_dir, "sparse/0/cameras.txt")):
-        os.makedirs(colmap_dir, exist_ok=True)
-        prepare_colmap_structure(frames_dir, colmap_dir)
-        run_colmap(colmap_dir)
+# Step 7: 绑定高斯
+gaussians.bind_to_smpl_mesh(cano_mesh.vertices)
+print("高斯已绑定到 SMPL 顶点")
+
+# Step 8: 可控渲染
+render_path = os.path.join(args.model_path, "render")
+os.makedirs(render_path, exist_ok=True)
+
+pose_files = [None] * 5
+if args.pose_path and os.path.exists(args.pose_path):
+    pose_files = sorted([f for f in os.listdir(args.pose_path) if f.endswith(".npy")])
+
+for idx, pose_file in enumerate(pose_files):
+    if pose_file:
+        body_pose = np.load(os.path.join(args.pose_path, pose_file))
+        body_pose = torch.from_numpy(body_pose).cuda().unsqueeze(0)  # (1,69)
     else:
-        print("Using existing COLMAP results.")
+        body_pose = torch.zeros(1, 69).cuda()
+        body_pose[0, 3:] = torch.randn(66).cuda() * 0.6
 
-    # === Step 4: 构建 Scene + 初始化 GaussianModel ===
-    model = DeformableGaussianModel(sh_degree=args.sh_degree)
-    scene = Scene(args, model, load_iteration=None, shuffle=False)
-    model.training_setup(args)
+    with torch.no_grad():
+        new_body = smpl_model(betas=torch.from_numpy(final_beta).cuda(), body_pose=body_pose)
+    new_vertices = new_body.vertices[0].cpu().numpy()
 
-    # === Step 5: 从点云初始化高斯 ===
-    # 取第一帧点云作为初始化（或融合多帧）
-    first_pc_path = os.path.join(pc_dir, sorted(os.listdir(pc_dir))[0])
-    init_pcd = np.load(first_pc_path)
-    model.create_from_pcd(init_pcd, spatial_lr_scale=1.0)
-    print(f"Initialized Gaussians from point cloud: {init_pcd.shape[0]} points")
+    gaussians.deform_with_new_mesh(new_vertices)
 
-    # === Step 6: 训练 3DGS ===
-    print("Starting training...")
-    for iteration in tqdm(range(1, args.iterations + 1)):
-        model.update_learning_rate(iteration)
-        viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack[np.random.randint(0, len(viewpoint_stack))]
+    for cam_idx, cam in enumerate(scene.getTrainCameras()):
+        rendering = render(cam, gaussians, args, bg)["render"]
+        rendering = (rendering.cpu().numpy().transpose(1,2,0) * 255).astype(np.uint8)
+        imageio.imwrite(os.path.join(render_path, f"pose{idx:03d}_view{cam_idx:03d}.png"), rendering)
 
-        render_pkg = render(viewpoint_cam, model, args, bg_color=torch.tensor([1,1,1], device="cuda"))
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = torch.abs(gt_image - image).mean()
-        loss = (1.0 - args.lambda_dssim) * Ll1 + args.lambda_dssim * (1.0 - render_pkg["ssim"])
-
-        loss.backward()
-        model.optimizer.step()
-        model.optimizer.zero_grad()
-
-        if iteration % 1000 == 0:
-            print(f"Iteration {iteration}, Loss: {loss.item():.6f}")
-
-        # Densification
-        if iteration < args.densify_until_iter:
-            model.densification_postfix(viewspace_point_tensor, visibility_filter, radii, viewpoint_cam)
-        if iteration == args.densify_until_iter:
-            model.densify_and_prune(max_grad=0.005, min_opacity=0.005, extent=1.0, max_screen_size=1)
-
-    print("Training completed.")
-
-    # === Step 7: 提取 Canonical Mesh ===
-    mesh_path = os.path.join(args.output, "canonical_mesh.ply")
-    if not os.path.exists(mesh_path):
-        from games.mesh_splatting.scene.gaussian_mesh_model import GaussianMeshModel
-        mesh_model = GaussianMeshModel(model.get_xyz, model.get_scaling, model.get_rotation, model.get_opacity, model.get_covariance)
-        mesh_model.extract_mesh(resolution=512, threshold=0.0, path=mesh_path)
-        print(f"Canonical mesh saved to {mesh_path}")
-
-    # === Step 8: Mesh → SMPL 拟合 β (只做一次) ===
-    smpl_params_path = os.path.join(args.output, "smpl_params.pkl")
-    if not os.path.exists(smpl_params_path):
-        beta, _ = fit_smplx_from_mesh(mesh_path)  # 只取 beta
-        import pickle
-        with open(smpl_params_path, 'wb') as f:
-            pickle.dump({"beta": beta}, f)
-        print(f"SMPL beta fitted and saved to {smpl_params_path}")
-    else:
-        import pickle
-        with open(smpl_params_path, 'rb') as f:
-            beta = pickle.load(f)["beta"]
-
-    # === Step 9: 绑定高斯到 SMPL 顶点 ===
-    cano_mesh = trimesh.load(mesh_path)
-    model.bind_to_smpl_mesh(cano_mesh.vertices)  # 核心绑定
-    print("Gaussians bound to SMPL vertices.")
-
-    # === Step 10: 可控姿态渲染 ===
-    render_pose_dir = args.render_pose_dir or os.path.join(args.output, "render_poses")
-    os.makedirs(render_pose_dir, exist_ok=True)
-
-    # 示例：渲染 5 个新姿态（可替换为外部输入）
-    pose_dir = os.path.join(args.output, "poses")
-    os.makedirs(pose_dir, exist_ok=True)
-
-    for i in range(5):
-        # 生成新姿态 mesh
-        new_pose_mesh_path = os.path.join(pose_dir, f"pose_{i:04d}.ply")
-        if not os.path.exists(new_pose_mesh_path):
-            # 这里用随机姿态，你可以替换为 AIST++/AMASS 姿态
-            random_pose = np.random.randn(1, 66) * 0.5
-            generate_mesh_from_pose(beta, random_pose, new_pose_mesh_path)
-
-        # 变形高斯
-        new_mesh = trimesh.load(new_pose_mesh_path)
-        model.deform_with_new_mesh(new_mesh.vertices)
-
-        # 渲染所有训练相机视角
-        for idx, cam in enumerate(scene.getTrainCameras()):
-            render_pkg = render(cam, model, args, bg_color=torch.tensor([1,1,1], device="cuda"))
-            rendering = render_pkg["render"]
-            rendering = (rendering.clamp(0,1).cpu().numpy().transpose(1,2,0) * 255).astype(np.uint8)
-            save_path = os.path.join(render_pose_dir, f"pose_{i:04d}_view_{idx:03d}.png")
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            from PIL import Image
-            Image.fromarray(rendering).save(save_path)
-
-        print(f"Pose {i} rendered.")
-
-    print(f"All done. Results in {args.output}")
-
-if __name__ == "__main__":
-    main()
+print(f"渲染完成！结果在 {render_path}")

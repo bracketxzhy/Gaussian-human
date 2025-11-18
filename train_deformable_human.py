@@ -1,6 +1,3 @@
-# train_deformable_human.py
-# 2025-11-15 06:00 PM HKT 最终修复版（已实测）
-
 import argparse
 import os
 import torch
